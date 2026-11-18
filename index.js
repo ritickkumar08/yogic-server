@@ -52,6 +52,9 @@ async function run() {
         const appliedCollection = database.collection("applied");
         // client.connect();
         await client.connect();
+
+        // One-time fix: applications saved before the status field existed are treated as pending
+        await appliedCollection.updateMany({ status: { $exists: false } }, { $set: { status: 'pending' } });
         await client.db("admin").command({ ping: 1 });
         console.log("Successfully connected to MongoDB!");
 
@@ -81,6 +84,19 @@ async function run() {
         }
 
 
+        // Allow the request only for the account owner (same email as in the token) or an admin
+        const verifySelfOrAdmin = (getEmail) => async (req, res, next) => {
+            const requested = getEmail(req);
+            if (requested && requested === req.decoded.email) {
+                return next();
+            }
+            const user = await userCollection.findOne({ email: req.decoded.email });
+            if (user?.role === 'admin') {
+                return next();
+            }
+            return res.status(403).send({ error: true, message: 'Forbidden access' });
+        }
+
         app.post('/new-user', async (req, res) => {
             const newUser = req.body;
 
@@ -95,12 +111,12 @@ async function run() {
 
 
         // GET ALL USERS
-        app.get('/users', async (req, res) => {
+        app.get('/users', verifyJWT, verifyAdmin, async (req, res) => {
             const users = await userCollection.find({}).toArray();
             res.send(users);
         })
         // GET USER BY ID
-        app.get('/users/:id', async (req, res) => {
+        app.get('/users/:id', verifyJWT, verifyAdmin, async (req, res) => {
             const id = req.params.id;
             const query = { _id: new ObjectId(id) };
             const user = await userCollection.findOne(query);
@@ -186,7 +202,7 @@ async function run() {
             const result = await classesCollection.find(query).toArray();
             res.send(result);
         })
-        app.get('/classes-manage', async (req, res) => {
+        app.get('/classes-manage', verifyJWT, verifyAdmin, async (req, res) => {
             const result = await classesCollection.find().toArray();
             res.send(result);
         })
@@ -283,7 +299,8 @@ async function run() {
         // Delete a item form cart
         app.delete('/delete-cart-item/:id', verifyJWT, async (req, res) => {
             const id = req.params.id;
-            const query = { classId: id };
+            // Only remove the item from the logged-in user's own cart
+            const query = { classId: id, userMail: req.decoded.email };
             const result = await cartCollection.deleteOne(query);
             res.send(result);
         })
@@ -302,32 +319,30 @@ async function run() {
         })
         // POST PAYMENT INFO 
         app.post('/payment-info', verifyJWT, async (req, res) => {
-            const paymentInfo = req.body;
+            // Always use the email from the verified token, never the one sent by the client
+            const userEmail = req.decoded.email;
+            const paymentInfo = { ...req.body, userEmail };
             const classesId = paymentInfo.classesId;
-            const userEmail = paymentInfo.userEmail;
-            const singleClassId = req.query.classId;
-            let query;
-            // const query = { classId: { $in: classesId } };
-            if (singleClassId) {
-                query = { classId: singleClassId, userMail: userEmail };
-            } else {
-                query = { classId: { $in: classesId } };
+            if (!Array.isArray(classesId) || classesId.length === 0 || !classesId.every(id => ObjectId.isValid(id))) {
+                return res.status(400).send({ error: true, message: 'classesId must be a non-empty list of valid ids' });
             }
+            const singleClassId = req.query.classId;
+            // Only clear this user's own cart rows (the old multi-class query deleted every user's rows)
+            const query = singleClassId
+                ? { classId: singleClassId, userMail: userEmail }
+                : { classId: { $in: classesId }, userMail: userEmail };
             const classesQuery = { _id: { $in: classesId.map(id => new ObjectId(id)) } }
-            const classes = await classesCollection.find(classesQuery).toArray();
             const newEnrolledData = {
                 userEmail: userEmail,
                 classesId: classesId.map(id => new ObjectId(id)),
                 transactionId: paymentInfo.transactionId,
             }
-            const updatedDoc = {
-                $set: {
-                    totalEnrolled: classes.reduce((total, current) => total + current.totalEnrolled, 0) + 1 || 0,
-                    availableSeats: classes.reduce((total, current) => total + current.availableSeats, 0) - 1 || 0,
-                }
-            }
-            // const updatedInstructor = await userCollection.find()
-            const updatedResult = await classesCollection.updateMany(classesQuery, updatedDoc, { upsert: true });
+            // Each class gets its own +1 student / -1 seat (the old code wrote one combined sum to every class)
+            const updatedDoc = { $inc: { totalEnrolled: 1, availableSeats: -1 } };
+            const updatedResult = await classesCollection.updateMany(
+                { ...classesQuery, availableSeats: { $gt: 0 } },
+                updatedDoc
+            );
             const enrolledResult = await enrolledCollection.insertOne(newEnrolledData);
             const deletedResult = await cartCollection.deleteMany(query);
             const paymentResult = await paymentCollection.insertOne(paymentInfo);
@@ -335,7 +350,7 @@ async function run() {
         })
 
 
-        app.get('/payment-history/:email', async (req, res) => {
+        app.get('/payment-history/:email', verifyJWT, verifySelfOrAdmin(req => req.params.email), async (req, res) => {
             const email = req.params.email;
             const query = { userEmail: email };
             const result = await paymentCollection.find(query).sort({ date: -1 }).toArray();
@@ -343,7 +358,7 @@ async function run() {
         })
 
 
-        app.get('/payment-history-length/:email', async (req, res) => {
+        app.get('/payment-history-length/:email', verifyJWT, verifySelfOrAdmin(req => req.params.email), async (req, res) => {
             const email = req.params.email;
             const query = { userEmail: email };
             const total = await paymentCollection.countDocuments(query);
@@ -471,7 +486,7 @@ async function run() {
         // Applied route 
         // Submit an application (status starts as 'pending').
         // A previously rejected application is replaced so the user can re-apply.
-        app.post('/as-instructor', async (req, res) => {
+        app.post('/as-instructor', verifyJWT, verifySelfOrAdmin(req => req.body?.email), async (req, res) => {
             const { name, email, experience } = req.body;
             if (!name || !email || !experience || !String(experience).trim()) {
                 return res.status(400).send({ error: true, message: 'name, email and experience are required' });
@@ -493,7 +508,7 @@ async function run() {
             const result = await appliedCollection.insertOne(application);
             res.send(result);
         })
-        app.get('/applied-instructors/:email',   async (req, res) => {
+        app.get('/applied-instructors/:email', verifyJWT, verifySelfOrAdmin(req => req.params.email), async (req, res) => {
             const email = req.params.email;
             const result = await appliedCollection.findOne({email});
             res.send(result);
