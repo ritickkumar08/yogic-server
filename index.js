@@ -50,14 +50,17 @@ async function run() {
         const enrolledCollection = database.collection("enrolled");
         const paymentCollection = database.collection("payments");
         const appliedCollection = database.collection("applied");
-        client.connect();
+        // client.connect();
+        await client.connect();
+        await client.db("admin").command({ ping: 1 });
+        console.log("Successfully connected to MongoDB!");
 
         // Verify admin
         const verifyAdmin = async (req, res, next) => {
             const email = req.decoded.email;
             const query = { email: email };
             const user = await userCollection.findOne(query);
-            if (user.role === 'admin') {
+            if (user?.role === 'admin') {
                 next()
             }
             else {
@@ -69,7 +72,7 @@ async function run() {
             const email = req.decoded.email;
             const query = { email: email };
             const user = await userCollection.findOne(query);
-            if (user.role === 'instructor' || user.role === 'admin') {
+            if (user?.role === 'instructor' || user?.role === 'admin') {
                 next()
             }
             else {
@@ -155,8 +158,26 @@ async function run() {
         app.get('/classes/:email', verifyJWT, verifyInstructor, async (req, res) => {
             const email = req.params.email;
             const query = { instructorEmail: email };
+            // Optional filter: /classes/:email?status=pending|approved|rejected
+            if (req.query.status) {
+                query.status = req.query.status;
+            }
             const result = await classesCollection.find(query).toArray();
             res.send(result);
+        })
+
+        // INSTRUCTOR DASHBOARD STATS
+        app.get('/instructor-stats/:email', verifyJWT, verifyInstructor, async (req, res) => {
+            const email = req.params.email;
+            const classes = await classesCollection.find({ instructorEmail: email }).toArray();
+            const count = (status) => classes.filter(cls => cls.status === status).length;
+            res.send({
+                totalClasses: classes.length,
+                approvedClasses: count('approved'),
+                pendingClasses: count('pending'),
+                rejectedClasses: count('rejected'),
+                totalEnrolled: classes.reduce((total, cls) => total + (cls.totalEnrolled || 0), 0),
+            });
         })
 
         // GET ALL CLASSES
@@ -385,6 +406,7 @@ async function run() {
             const instructors = (await userCollection.find({ role: 'instructor' }).toArray()).length;
             const totalClasses = (await classesCollection.find().toArray()).length;
             const totalEnrolled = (await enrolledCollection.find().toArray()).length;
+            const pendingApplications = await appliedCollection.countDocuments({ status: 'pending' });
             // const totalRevenue = await paymentCollection.find().toArray();
             // const totalRevenueAmount = totalRevenue.reduce((total, current) => total + parseInt(current.price), 0);
             const result = {
@@ -393,18 +415,13 @@ async function run() {
                 instructors,
                 totalClasses,
                 totalEnrolled,
+                pendingApplications,
                 // totalRevenueAmount
             }
             res.send(result);
 
         })
 
-        // !GET ALL INSTrUCTOR  
-
-        app.get('/instructors', async (req, res) => {
-            const result = await userCollection.find({ role: 'instructor' }).toArray();
-            res.send(result);
-        })
 
 
 
@@ -452,14 +469,78 @@ async function run() {
         })
 
         // Applied route 
+        // Submit an application (status starts as 'pending').
+        // A previously rejected application is replaced so the user can re-apply.
         app.post('/as-instructor', async (req, res) => {
-            const data = req.body;
-            const result = await appliedCollection.insertOne(data);
+            const { name, email, experience } = req.body;
+            if (!name || !email || !experience || !String(experience).trim()) {
+                return res.status(400).send({ error: true, message: 'name, email and experience are required' });
+            }
+            const existing = await appliedCollection.findOne({ email });
+            if (existing && existing.status !== 'rejected') {
+                return res.status(409).send({ error: true, message: 'You have already applied' });
+            }
+            if (existing) {
+                await appliedCollection.deleteOne({ _id: existing._id });
+            }
+            const application = {
+                name,
+                email,
+                experience: String(experience).trim(),
+                status: 'pending',
+                submittedAt: new Date(),
+            };
+            const result = await appliedCollection.insertOne(application);
             res.send(result);
         })
         app.get('/applied-instructors/:email',   async (req, res) => {
             const email = req.params.email;
             const result = await appliedCollection.findOne({email});
+            res.send(result);
+        });
+
+        // ADMIN: list all applications (newest first)
+        app.get('/applied-instructors', verifyJWT, verifyAdmin, async (req, res) => {
+            const query = req.query.status ? { status: req.query.status } : {};
+            const result = await appliedCollection.find(query).sort({ submittedAt: -1 }).toArray();
+            res.send(result);
+        });
+
+        // ADMIN: approve or reject an application.
+        // Body: { status: 'approved' | 'rejected', reason?: string }
+        // Approving also turns the applicant's user role into 'instructor'.
+        app.put('/applied-instructors/:id', verifyJWT, verifyAdmin, async (req, res) => {
+            const { status, reason } = req.body;
+            if (!['approved', 'rejected'].includes(status)) {
+                return res.status(400).send({ error: true, message: "status must be 'approved' or 'rejected'" });
+            }
+            if (!ObjectId.isValid(req.params.id)) {
+                return res.status(400).send({ error: true, message: 'Invalid application id' });
+            }
+            const filter = { _id: new ObjectId(req.params.id) };
+            const application = await appliedCollection.findOne(filter);
+            if (!application) {
+                return res.status(404).send({ error: true, message: 'Application not found' });
+            }
+            if (status === 'approved') {
+                const roleResult = await userCollection.updateOne({ email: application.email }, { $set: { role: 'instructor' } });
+                if (roleResult.matchedCount === 0) {
+                    return res.status(404).send({ error: true, message: 'Applicant user account not found' });
+                }
+            }
+            const updateDoc = {
+                $set: { status, reason: status === 'rejected' ? (reason || '') : '', reviewedAt: new Date() }
+            };
+            const result = await appliedCollection.updateOne(filter, updateDoc);
+            res.send(result);
+        });
+
+        // ADMIN: delete an application
+        app.delete('/applied-instructors/:id', verifyJWT, verifyAdmin, async (req, res) => {
+            if (!ObjectId.isValid(req.params.id)) {
+                return res.status(400).send({ error: true, message: 'Invalid application id' });
+            }
+            const result = await appliedCollection.deleteOne({ _id: new ObjectId(req.params.id) });
             res.send(result);
         });
         // Send a ping to confirm a successful connection
@@ -469,16 +550,23 @@ async function run() {
         // Ensures that the client will close when you finish/error
     }
 }
-run().catch(console.dir);
 
+const startServer = async () => {
+    try {
+        await run();
 
-app.get('/', (req, res) => {
-    res.send('Yoga Master Server is running!');
-})
+        app.get('/', (req, res) => {
+            res.send('Yogic Server is running!');
+        });
 
+        app.listen(port, () => {
+            console.log(`SERVER IS RUNNING ON PORT ${port}`);
+        });
 
-// Listen
-app.listen(port, () => {
-    console.log(`SERVER IS RUNNING ON PORT ${port}`);
-})
+    } catch (error) {
+        console.error("Server startup failed:", error);
+        process.exit(1);
+    }
+};
 
+startServer();
